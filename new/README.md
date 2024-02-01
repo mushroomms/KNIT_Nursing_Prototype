@@ -1,3 +1,1 @@
-Patient Device - Raspberry Pi 4 <br>
-Gateway Device - M5Stack Basic v2.6 <br>
-Nurse Device - M5Stack Basic v2.6
+The folder contains updated code which uses either the Easel ES920LR3 LoRa or Interplan IM920sL LPWAN module
