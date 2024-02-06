@@ -237,7 +237,7 @@ if __name__ == '__main__':
     try:
         while True:
 
-            asyncio.run(main(iwc, mqtt))
+            asyncio.run(main(iwc, client))
 
     except KeyboardInterrupt:                       # Ctrl + C End
         iwc.gpio_clean()
