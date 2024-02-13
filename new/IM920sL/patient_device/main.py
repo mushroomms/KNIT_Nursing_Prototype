@@ -60,21 +60,22 @@ class SharedData:
 
 shared_data = SharedData()
 
-ROOM = 1
-
-CONFIGURED = 1  # LPWAN module configuration status. 1 = configured
+ROOM = 1        # Room number
+CONFIGURED = True  # LPWAN module configuration status. 1 = configured
+ENC_KEY = "" # 256bits in hex
+NODE_ID = "0002"
 
 # Configuration of LPWAN module
 def lpwan_setup(iwc):
     print("Configuring LPWAN module")
-    iwc.Write_920("ENWR")       # parameter writing
-    iwc.Write_920("EENC")       # packet encryption enabled
-    iwc.Write_920("STNN 0002")  # node ID 0002
-    iwc.Write_920("STGN")       # join group as slave unit
-    iwc.Write_920("STNM 2")     # network tree mode
-    iwc.Write_920("STRT 1")     # transmission high speed mode
-    iwc.Write_920("ECIO")       # enable character encoding
-    iwc.Write_920("DSWR")       # disable parameter writing
+    iwc.Write_920("ENWR")               # parameter writing
+    iwc.Write_920("EENC")               # packet encryption enabled
+    iwc.Write_920("STNN " + NODE_ID)    # node ID 0002
+    iwc.Write_920("STGN")               # join group as slave unit
+    iwc.Write_920("STNM 1")             # network multihop mode
+    iwc.Write_920("STRT 1")             # transmission high speed mode
+    iwc.Write_920("ECIO")               # enable character encoding
+    iwc.Write_920("DSWR")               # disable parameter writing
 
 # Start recording HR and SPO2
 def setup():
@@ -88,7 +89,7 @@ def setup():
 # function to send a unicast to a specific node ID
 def unicast(nodeid, msg, iwc):
     cmd = 'TXDU{} {}'.format(nodeid, msg)
-    print(cmd)
+    print("[+] Sent: ", cmd)
     while True:     # attempt to walkaround random error 121 Remote I/O error. (Not the best option)
         try:
             iwc.Write_920(cmd)          # note that paramter cmd only takes in MAX 32 characters (including whitespaces)
@@ -103,18 +104,33 @@ def unicast(nodeid, msg, iwc):
 # function to send a broadcast 
 def broadcast(msg, iwc):
     cmd = 'TXDA{}'.format(msg)
-    iwc.Write_920(cmd)          # note that paramter cmd only takes in MAX 32 characters (including whitespaces)
+    print("[+] Sent: ", cmd)
+    while True:     # attempt to walkaround random error 121 Remote I/O error. (Not the best option)
+        try:
+            iwc.Write_920(cmd)          # note that paramter cmd only takes in MAX 32 characters (including whitespaces)
+            break
+        except OSError as e:
+            if e.errno == 121:
+                print("Remote IO error... retrying ")   # Retry until successful
+                continue
+            else:
+                break
 
 # Monitor vitals every 1s and update value
 async def monitorVitals(shared_data, iwc, lock):
+    emergency_count = 0
+    timeout_active = False
+    timeout_start = None
+    send_counter = 0
+
     while True:
         max30102.get_heartbeat_SPO2()  # getting heartrate and sp02 reading
         spo2 = max30102.SPO2 if max30102.SPO2 >= 0 else 0
         bp = max30102.heartbeat if max30102.heartbeat >= 0 else 0
-        
+
         # Get the current date and time
         now = datetime.datetime.now()
-        
+
         # Format the date and time using strftime()
         formatted_time = now.strftime("%d/%m/%Y %H:%M:%S")
 
@@ -137,30 +153,72 @@ async def monitorVitals(shared_data, iwc, lock):
         # if emergency, send directly to nurse device
         if spo2 <= 88 or bp >= 150 or bp < 60:
             shared_data.status = 1              # if status 1 = emergency
-            #emergency = json.dumps({'b':bp,'s':spo2,'r':ROOM}, separators=(',',':'))
-            emergency = '{}:{}:{}:{}'.format(ROOM, shared_data.status, bp, spo2)    # room:status:hr:sp   
-            async with lock:        # Acquire lock before I2C access
-                unicast("0001", emergency, iwc)     # sending msg to gateway
+            emergency = '{}:{}:{}:{}'.format(ROOM, "1", bp, spo2)    # room:status:hr:sp
+
+            if not timeout_active:
+                send_counter = 0
+        
+                async with lock:        # Acquire lock before I2C access
+                    broadcast("N" + emergency, iwc)     # broadcast to Nurse devices if emergency
+                
+                emergency_count += 1
+
+                if emergency_count >= 30:
+                    timeout_active = True
+                    timeout_start = datetime.datetime.now()
+                    print("Emergency message timeout activated for 60 seconds")
+            else:
+                print("Emergency message suppressed due to timeout")
+                
+                
+                # *directly stream data to everyone (polling inconsistant)
+                async with lock:        # Acquire lock before I2C access
+                    if send_counter == 4 or send_counter == 0:
+                        broadcast("N" + emergency, iwc)     # broadcast to Nurse devices
+                        send_counter = 1
+                
+                send_counter += 1
+                #   
+
         else:
+            emergency_count = 0
+            timeout_active = False
             shared_data.status = 0  # if status 0 = non-emergency
+            
+            
+            # *directly stream data to everyone (polling inconsistant)
+            if send_counter == 4 or send_counter == 0:
+                msg = '{}:{}:{}:{}'.format(ROOM, "0", bp, spo2)    # room:status:hr:sp
+                broadcast("N" + msg, iwc)    # return vitals to gateway
+                send_counter = 1
+            send_counter += 1
+            #
+            
 
-        await asyncio.sleep(1)      # wait for 1 second before taking result
+        if timeout_active:
+            now = datetime.datetime.now()
+            if (now - timeout_start).total_seconds() >= 60: # 1 minute timeout
+                timeout_active = False
+                emergency_count = 0
+                print("Emergency message timeout cleared")
 
-# monitor incoming LoRa data every 1ms
+        await asyncio.sleep(1)      # wait for 1 second before taking result (sensor supports frequency up to 1sec per reading)
+
+# monitor incoming data every 1ms
 async def monitorRTS(shared_data, iwc, lock):
     while True:
         async with lock:  # Acquire lock before I2C access
             rx_data = iwc.Read_920()                    # 受信処理           
             if len(rx_data) >= 1:                       # 受信してない時は''が返り値 (長さ0)        
-                print(rx_data, end='')                  # 受信データを画面表示
-            
-                if len(rx_data) >= 11:                          # 11は受信データのノード番号+RSSI等の長さ
+                print(rx_data, end='')                  # 受信データを画面表示           
+                
+                if len(rx_data) >= 11:                  # 11は受信データのノード番号+RSSI等の長さ
                     if (rx_data[2]==',' and    
                         rx_data[7]==',' and rx_data[10]==':'):
                         rxid = rx_data[3:7]                         # 子機(送信機)のIDを抽出 [sender ID]
                         payload = rx_data[11:]
                         
-                        if payload == "POLL" and rxid == "0001":    # if polling message originated from gateway
+                        if payload.startswith("POLL_" + NODE_ID) and rxid == "0001":    # if polling message originated from gateway
                             # Access shared data directly
                             spo2 = shared_data.spo2
                             bp = shared_data.bp
@@ -170,17 +228,18 @@ async def monitorRTS(shared_data, iwc, lock):
                             #msg = json.dumps({'s': status, 'r': ROOM, 'bp': bp, 'sp': spo2})
                             msg = '{}:{}:{}:{}'.format(ROOM, status, bp, spo2)    # room:status:hr:sp   
                             
-                            print("[+] Received: ", line)
-                            unicast("0001", msg, iwc)    # return vitals to gateway
+                            print("[+] Polling received")
+                            unicast("0001", "P" + msg, iwc)    # return vitals to gateway
 
-        await asyncio.sleep(0.2)
+        await asyncio.sleep(0)
 
 # Create a lock object
 lock = asyncio.Lock()
 
 # main function which monitor vitals and RTS
 async def main(iwc):
-    await asyncio.gather(monitorVitals(shared_data, iwc, lock), monitorRTS(shared_data, iwc, lock))
+    while True:
+        await asyncio.gather(monitorVitals(shared_data, iwc, lock), monitorRTS(shared_data, iwc, lock))
 
 if __name__ == "__main__":
     setup()     # setup heartrate/sp02 sensor
@@ -189,13 +248,14 @@ if __name__ == "__main__":
     rx_data = iwc.Read_920()                    # 受信処理           
     if len(rx_data) >= 1:                       # 受信してない時は''が返り値 (長さ0)        
             print(rx_data, end='')              # 受信データを画面表示
-            time.sleep(1)
+            time.sleep(5)
 
-    if CONFIGURED == 0:
+    if CONFIGURED == False:
         lpwan_setup(iwc)
 
     try:
-        asyncio.run(main(iwc))             # Start the main asynchronous function
+        while True:
+            asyncio.run(main(iwc))             # Start the main asynchronous function
     
     except KeyboardInterrupt:           # Ctrl + C End
         print("END\n")
@@ -206,6 +266,7 @@ if __name__ == "__main__":
 
     finally:                            # sensor cleanup
         max30102.sensor_end_collect()
-        #iwc.gpio_clean()
+        iwc.gpio_clean()
 
         sys.stdout.flush()
+
